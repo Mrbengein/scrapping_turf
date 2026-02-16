@@ -1,0 +1,306 @@
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║         GENY.COM → PostgreSQL  -  Mise à jour des résultats      ║
+║  Récupère l'ordre d'arrivée depuis la page des réunions PMU      ║
+║  et met à jour la colonne ordre_arrivee dans la table courses     ║
+╚══════════════════════════════════════════════════════════════════╝
+
+PRÉ-REQUIS :
+    Avoir exécuté add_ordre_arrivee.sql dans PostgreSQL
+
+UTILISATION :
+    python geny_resultats.py --date 2026-02-14        # une seule date
+    python geny_resultats.py --historique 365          # 365 derniers jours
+    python geny_resultats.py --debut 2025-01-01 --fin 2026-02-15
+"""
+
+import asyncio
+import re
+import argparse
+import logging
+import os
+from datetime import datetime, timedelta
+from typing import Optional
+
+import psycopg2
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ── Config BDD ────────────────────────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+DB_CONFIG = {
+    "host":     os.getenv("DB_HOST", "localhost"),
+    "port":     int(os.getenv("DB_PORT", 5432)),
+    "dbname":   os.getenv("DB_NAME", "turf_stats"),
+    "user":     os.getenv("DB_USER", "turf"),
+    "password": os.getenv("DB_PASSWORD", ""),
+}
+
+BASE_URL = "https://www.geny.com"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SCRAPING – récupération des résultats depuis la page des réunions
+#
+# Sur la page https://www.geny.com/reunions-courses-pmu?date=YYYY-MM-DD
+# chaque course affiche son résultat sous forme texte :
+#   "3 - 2 - 1"  ou  "13 - 9 - 1 - 16 - 11"
+# juste après les liens Partants/Casaques/Cotes/Rapports
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def scrape_resultats_date(page, date_str: str) -> list[dict]:
+    """
+    Scrape la page des réunions d'une date et extrait pour chaque course :
+    - l'URL de la page partants (pour identifier la course en BDD)
+    - l'ordre d'arrivée (ex: "3-2-1-5-4")
+
+    Retourne une liste de dicts : {url_partants, nom_course, ordre_arrivee}
+    """
+    url = f"{BASE_URL}/reunions-courses-pmu?date={date_str}"
+    log.info(f"  Résultats du {date_str}...")
+
+    try:
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+        await page.wait_for_timeout(2000)
+    except PlaywrightTimeout:
+        log.warning(f"  Timeout sur {url}")
+        return []
+
+    # On cherche tous les blocs de course via JavaScript
+    # Chaque course = un bloc contenant un lien /partants-pmu/ + un texte résultat
+    resultats = await page.evaluate(f"""
+        () => {{
+            const results = [];
+            const date = '{date_str}';
+
+            // Trouver tous les liens vers les pages partants
+            const links = document.querySelectorAll('a[href*="/partants-pmu/"]');
+
+            links.forEach(link => {{
+                const href = link.getAttribute('href');
+                if (!href) return;
+
+                // Remonter au bloc parent de la course (chercher le texte résultat)
+                // Le résultat est un nœud texte dans le même conteneur, format "N - N - N"
+                let container = link.closest('li')?.closest('ul')?.closest('div') 
+                             || link.closest('li')?.parentElement?.parentElement;
+
+                if (!container) return;
+
+                const fullText = container.innerText || '';
+
+                // Chercher le pattern résultat : séquence de "N - N" ou "N - N - N - N - N"
+                const match = fullText.match(/(\\d+(?:\\s*-\\s*\\d+){{2,}})/);
+                if (!match) return;
+
+                // Nettoyer : "13 - 9 - 1 - 16 - 11" → "13-9-1-16-11"
+                const ordre = match[1].replace(/\\s*-\\s*/g, '-').trim();
+
+                // Extraire le nom de la course depuis l'URL
+                const slug = href.split('/').pop();
+                const afterDate = slug.replace(date + '-', '');
+                let nomCourse = '';
+                if (afterDate.includes('-pmu-')) {{
+                    nomCourse = afterDate.split('-pmu-')[1]
+                        .replace(/_c\\d+$/, '')
+                        .replace(/-/g, ' ')
+                        .replace(/\\b\\w/g, c => c.toUpperCase());
+                }}
+
+                results.push({{
+                    url_partants: href,
+                    nom_course: nomCourse,
+                    ordre_arrivee: ordre
+                }});
+            }});
+
+            // Dédupliquer par URL
+            const seen = new Set();
+            return results.filter(r => {{
+                if (seen.has(r.url_partants)) return false;
+                seen.add(r.url_partants);
+                return true;
+            }});
+        }}
+    """)
+
+    log.info(f"  → {len(resultats)} résultats trouvés")
+    for r in resultats:
+        log.info(f"    {r['nom_course']:40s} → {r['ordre_arrivee']}")
+
+    return resultats
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BASE DE DONNÉES – mise à jour de ordre_arrivee
+# ═════════════════════════════════════════════════════════════════════════════
+
+def get_conn():
+    return psycopg2.connect(**DB_CONFIG)
+
+
+def update_ordre_arrivee(resultats: list[dict], date_str: str) -> int:
+    """
+    Met à jour la colonne ordre_arrivee pour chaque course trouvée.
+    Identifie la course par son nom_prix + date_course.
+    Retourne le nombre de courses mises à jour.
+    """
+    if not resultats:
+        return 0
+
+    conn = get_conn()
+    count = 0
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                date_debut = datetime.strptime(date_str, "%Y-%m-%d")
+                date_fin   = date_debut + timedelta(days=1)
+
+                for r in resultats:
+                    nom_course    = r.get("nom_course", "").strip()
+                    ordre_arrivee = r.get("ordre_arrivee", "").strip()
+                    url_partants  = r.get("url_partants", "")
+
+                    if not ordre_arrivee:
+                        continue
+
+                    # Stratégie 1 : identifier par le nom extrait de l'URL
+                    if nom_course:
+                        cur.execute(
+                            """
+                            UPDATE courses
+                            SET ordre_arrivee = %s
+                            WHERE LOWER(nom_prix) LIKE LOWER(%s)
+                              AND date_course >= %s
+                              AND date_course <  %s
+                              AND (ordre_arrivee IS NULL OR ordre_arrivee = '')
+                            """,
+                            (ordre_arrivee, f"%{nom_course}%", date_debut, date_fin)
+                        )
+                        if cur.rowcount > 0:
+                            count += cur.rowcount
+                            log.info(f"    ✓ Mis à jour : {nom_course} → {ordre_arrivee}")
+                            continue
+
+                    # Stratégie 2 : identifier par l'ID Geny dans l'URL (_cXXXXX)
+                    # On stocke aussi l'ordre pour les courses non encore en BDD
+                    m = re.search(r"_c(\d+)$", url_partants)
+                    if m:
+                        # Pas de colonne geny_id en base, on essaie par nom approximatif
+                        # via le slug de l'URL
+                        slug = url_partants.split("/")[-1]
+                        after = slug.replace(f"{date_str}-", "")
+                        if "-pmu-" in after:
+                            nom_slug = after.split("-pmu-", 1)[1]
+                            nom_slug = re.sub(r"_c\d+$", "", nom_slug)
+                            nom_mots = nom_slug.replace("-", " ")
+
+                            cur.execute(
+                                """
+                                UPDATE courses
+                                SET ordre_arrivee = %s
+                                WHERE LOWER(nom_prix) LIKE LOWER(%s)
+                                  AND date_course >= %s
+                                  AND date_course <  %s
+                                """,
+                                (ordre_arrivee, f"%{nom_mots}%", date_debut, date_fin)
+                            )
+                            if cur.rowcount > 0:
+                                count += cur.rowcount
+                                log.info(f"    ✓ Mis à jour (slug) : {nom_mots} → {ordre_arrivee}")
+
+        log.info(f"  → {count} courses mises à jour en BDD")
+    except Exception as e:
+        log.error(f"  Erreur BDD : {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+    return count
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ORCHESTRATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def process_date(date_str: str) -> int:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        ctx = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = await ctx.new_page()
+
+        resultats = await scrape_resultats_date(page, date_str)
+        await browser.close()
+
+    return update_ordre_arrivee(resultats, date_str)
+
+
+async def process_range(date_debut: datetime, date_fin: datetime) -> None:
+    current = date_debut
+    total   = (date_fin - date_debut).days + 1
+    i = 0
+
+    while current <= date_fin:
+        i += 1
+        date_str = current.strftime("%Y-%m-%d")
+        log.info(f"\n{'='*60}\nJour {i}/{total} : {date_str}\n{'='*60}")
+
+        try:
+            n = await process_date(date_str)
+            log.info(f"  OK : {n} courses mises à jour")
+        except Exception as e:
+            log.error(f"  ERREUR {date_str} : {e}")
+
+        current += timedelta(days=1)
+        await asyncio.sleep(3)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# POINT D'ENTRÉE
+# ═════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Mise à jour des résultats (ordre d'arrivée) depuis Geny"
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--date",       help="YYYY-MM-DD")
+    group.add_argument("--historique", type=int, metavar="JOURS")
+    group.add_argument("--debut",      help="YYYY-MM-DD (avec --fin)")
+    parser.add_argument("--fin",       default=None)
+
+    args = parser.parse_args()
+
+    if args.date:
+        asyncio.run(process_date(args.date))
+
+    elif args.historique:
+        fin   = datetime.now()
+        debut = fin - timedelta(days=args.historique)
+        log.info(f"Historique {args.historique} jours : {debut.date()} → {fin.date()}")
+        asyncio.run(process_range(debut, fin))
+
+    elif args.debut:
+        debut = datetime.strptime(args.debut, "%Y-%m-%d")
+        fin   = datetime.strptime(args.fin, "%Y-%m-%d") if args.fin else datetime.now()
+        asyncio.run(process_range(debut, fin))
+
+
+if __name__ == "__main__":
+    main()
